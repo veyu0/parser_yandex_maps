@@ -1,67 +1,104 @@
 import time
-import requests
+import logging
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.webdriver import ActionChains
+from selenium.webdriver.firefox.options import Options
+from webdriver_manager.firefox import GeckoDriverManager
+from selenium.webdriver.firefox.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
+import random
 
-headers = {
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/106.0.0.0 Safari/537.36",
-    "accept-encoding": "gzip, deflate, br",
-    "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("telegram_parser.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
+def scrolling_and_parsing(driver):
+    wait = WebDriverWait(driver, 10)
+    container = wait.until(
+            EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list"))
+        )
+    logger.info("✅ Контейнер найден")
+    
+    batch_size = 5
+    processed_items = set()
+    total_processed = 0
+    empty_scrolls = 0
+    MAX_EMPTY_SCROLLS = 3
 
-def get_data_html(url):
-    options = webdriver.ChromeOptions()
-    options.binary_location = "/Applications/Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev"
-    chrome_driver_binary = "[path to driver]"
-    driver = webdriver.Chrome(chrome_driver_binary, chrome_options=options)
-    driver.maximize_window()
+    logger.info(f"🔄 Начинаем прокрутку порциями по {batch_size}...")
 
-    try:
-        driver.get(url=url)
-        time.sleep(5)
-        while True:
-            end_block = driver.find_element(By.CLASS_NAME, 'search-list-meta-view')
-            if driver.find_elements(By.CLASS_NAME, 'add-business-view'):
-                with open('index.html', 'w') as file:
-                    file.write(driver.page_source)
-                break
-            else:
-                action = ActionChains(driver)
-                action.move_to_element(end_block).perform()
-                time.sleep(5)
-    except Exception as ex:
-        print(ex)
-    finally:
-        driver.close()
-        driver.quit()
+    while True:
+        try:
+            driver.execute_script("window.scrollBy(0, 1000);")
+            time.sleep(4)  # Ждём подгрузки
 
+            try:
+                items = container.find_elements(By.TAG_NAME, "li")
+                visible_items = [i for i in items if i.is_displayed()]
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось получить элементы: {e}")
+                visible_items = []
 
-def get_items_urls(file_path):
-    with open(file_path) as file:
-        src = file.read()
+            if not visible_items:
+                empty_scrolls += 1
+                logger.info(f"⏳ Нет видимых элементов ({empty_scrolls}/{MAX_EMPTY_SCROLLS})...")
+                if empty_scrolls >= MAX_EMPTY_SCROLLS:
+                    logger.info("✅ Прокрутка завершена.")
+                    break
+                continue
 
-    soup = BeautifulSoup(src, 'lxml')
-    items = soup.find_all(class_='search-snippet-view')
+            empty_scrolls = 0
 
-    urls = []
-    for item in items:
-        item_url = item.find('a', class_='search-snippet-view__link-overlay _focusable').get('href')
-        urls.append('https://yandex.ru' + item_url)
+            new_items = []
+            for item in visible_items:
+                item_hash = hash(item.text[:100])
+                if item_hash not in processed_items:
+                    new_items.append((item, item_hash))
+            
+            if not new_items:
+                continue
 
-    with open('urls.txt', 'w') as file:
-        for url in urls:
-            file.write(f'{url}\n')
+            batch = new_items[:batch_size]
+            logger.info(f"📦 Новая порция: {len(batch)} элементов (всего: {total_processed})")
 
-    return '[INFO Urls collected!]'
+            for idx, (item, item_hash) in enumerate(batch, 1):
+                try:
+                    processed_items.add(item_hash)
+
+                    title = safe_find("._title_20enb_53") or f"untitled_{total_processed + idx}"
+                    phone = safe_find("._descr_20enb_66") or ""
+                    site = safe_find("._action_views_20enb_121") or ""
+
+                    logger.info(f"→ #{total_processed + idx}: '{title[:40]}...' | {views}")
+
+                    #TODO write parsing func
+
+                    total_processed += 1
+                    logger.info(f"✓ Элемент {total_processed} обработан")
+
+                except Exception as e:
+                    logger.error(f"✗ Ошибка в элементе: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка в цикле: {e}")
+            break
+        
+    logger.info(f"🎉 Готово! Обработано: {total_processed}")
+    return total_processed
 
 
 def main():
-    get_data_html(url='https://yandex.ru/maps/213/moscow/search/%D0%BE%D1%81%D0%B0%D0%B3%D0%BE%20%D0%BC%D0%BE%D1%81%D0%BA%D0%B2%D0%B0/?ll=37.650216%2C55.724799&page=28&sll=37.576943%2C55.724799&sspn=1.966553%2C0.847911&z=10')
-    get_items_urls(file_path='[file_path]')
+    url = 'https://yandex.ru/maps/213/moscow/category/electrical_products/184107066/?ll=37.581429%2C55.766542&sll=37.617700%2C55.755863&sspn=1.395264%2C0.525064&z=10'
+    
 
 
 if __name__ == '__main__':
