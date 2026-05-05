@@ -72,97 +72,152 @@ def scrolling_and_parsing(driver, url):
     driver.get(url)
     wait = WebDriverWait(driver, 10)
     
-    batch_size = 5
     processed_urls = set()
     total_processed = 0
     empty_scrolls = 0
     MAX_EMPTY_SCROLLS = 3
+    BATCH_SIZE = 5
 
-    logger.info(f"🔄 Начинаем прокрутку порциями по {batch_size}...")
+    logger.info(f"🔄 Начинаем прокрутку порциями по {BATCH_SIZE}...")
 
     while True:
+        # 🔁 1. Перепоиск контейнера и элементов
         try:
-            # Прокрутка
-            driver.execute_script("window.scrollBy(0, 1000);")
-            time.sleep(3)
-
-            # 🔁 Всегда перепоиск контейнера и элементов
-            try:
-                container = wait.until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list"))
-                )
-                items = container.find_elements(By.TAG_NAME, "li")
-                visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
-            except Exception as e:
-                logger.warning(f"⚠️ Не удалось получить элементы: {e}")
-                visible_items = []
-
-            if not visible_items:
-                empty_scrolls += 1
-                logger.info(f"⏳ Нет видимых элементов ({empty_scrolls}/{MAX_EMPTY_SCROLLS})...")
-                if empty_scrolls >= MAX_EMPTY_SCROLLS:
-                    logger.info("✅ Прокрутка завершена.")
-                    break
-                continue
-
-            empty_scrolls = 0
-
-            # 🔁 Собираем уникальные идентификаторы + индексы для повторного поиска
-            candidates = []
-            for idx, item in enumerate(visible_items):
-                try:
-                    link = item.find_element(By.CSS_SELECTOR, "a[href]")
-                    item_url = link.get_attribute("href")
-                    if item_url and item_url not in processed_urls:
-                        candidates.append((idx, item_url))
-                except:
-                    continue
-
-            if not candidates:
-                continue
-
-            # 🔁 Обрабатываем по ОДНОМУ элементу за итерацию
-            for idx, item_url in candidates[:batch_size]:
-                try:
-                    # 🔁 Перепоиск контейнера и элементов перед каждым кликом
-                    container = wait.until(
-                        EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list"))
-                    )
-                    items = container.find_elements(By.TAG_NAME, "li")
-                    visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
-                    
-                    if idx >= len(visible_items):
-                        continue
-                        
-                    fresh_item = visible_items[idx]
-                    
-                    processed_urls.add(item_url)
-                    title, phone, site = parsing(item=fresh_item, driver=driver)
-                    time.sleep(1)
-                    
-                    logger.info(f"→ #{total_processed + 1}: '{title[:40]}' | {phone} | {site}")
-                    total_processed += 1
-                    logger.info(f"✓ Элемент {total_processed} обработан")
-
-                except Exception as e:
-                    logger.error(f"✗ Ошибка в элементе: {e}")
-                    # 🔁 Попытка восстановления после ошибки
-                    try:
-                        if driver.current_url != url:
-                            driver.back()
-                            wait.until(EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list")))
-                            time.sleep(1)
-                    except:
-                        pass
-                    continue
-
+            list_container = wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list"))
+            )
+            items = list_container.find_elements(By.TAG_NAME, "li")
+            visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
         except Exception as e:
-            logger.error(f"❌ Ошибка в цикле: {e}")
-            break
+            logger.warning(f"⚠️ Не удалось получить элементы: {e}")
+            visible_items = []
+
+        # 🔁 2. Собираем кандидатов
+        candidates = []
+        for idx, item in enumerate(visible_items):
+            try:
+                link = item.find_element(By.CSS_SELECTOR, "a[href*='/maps/org/']")
+                item_url = link.get_attribute("href")
+                if item_url and item_url not in processed_urls:
+                    candidates.append((idx, item_url))
+            except:
+                continue
+
+        # 🔁 3. Если нет новых элементов — скроллим или завершаем
+        if not candidates:
+            empty_scrolls += 1
+            logger.info(f"⏳ Нет новых элементов ({empty_scrolls}/{MAX_EMPTY_SCROLLS})...")
+            if empty_scrolls >= MAX_EMPTY_SCROLLS:
+                logger.info("✅ Прокрутка завершена.")
+                break
+            
+            # 🔄 СКРОЛЛ через универсальную функцию
+            scrolled = _scroll_list_container(driver)
+            time.sleep(2.5)
+            continue
+
+        empty_scrolls = 0
         
+        # 🔁 4. Берём батч
+        batch = candidates[:BATCH_SIZE]
+        logger.info(f"📦 Новая порция: {len(batch)} элементов (всего: {total_processed})")
+
+        # 🔁 5. Обрабатываем каждый элемент с перепоиском
+        for batch_idx, (item_index, item_url) in enumerate(batch, 1):
+            try:
+                list_container = wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list"))
+                )
+                items = list_container.find_elements(By.TAG_NAME, "li")
+                visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
+                
+                if item_index >= len(visible_items):
+                    continue
+                    
+                fresh_item = visible_items[item_index]
+                processed_urls.add(item_url)
+                title, phone, site = parsing(item=fresh_item, driver=driver)
+                logger.info(f"→ #{total_processed + batch_idx}: '{title[:40]}' | {phone} | {site}")
+                
+            except Exception as e:
+                logger.error(f"✗ Ошибка в элементе: {e}")
+                try:
+                    if driver.current_url != url:
+                        driver.back()
+                        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list")))
+                        time.sleep(1)
+                except:
+                    pass
+                continue
+
+        total_processed += len(batch)
+        logger.info(f"✓ Батч завершён. Всего обработано: {total_processed}")
+        
+        # 🔄 СКРОЛЛ после батча
+        scrolled = _scroll_list_container(driver)
+        time.sleep(2.5)
+
     logger.info(f"🎉 Готово! Обработано: {total_processed}")
     return total_processed
 
+def _scroll_list_container(driver, scroll_amount=600):
+    """
+    Универсальная прокрутка: находит первый скроллящийся родитель 
+    у контейнера списка и скроллит его.
+    Возвращает True, если скролл выполнен, False если достигнут конец.
+    """
+    try:
+        # JS-скрипт: находит скроллящийся контейнер и прокручивает его
+        result = driver.execute_script(f"""
+            // Находим ul.search-list-view__list
+            var list = document.querySelector('ul.search-list-view__list');
+            if (!list) return {{found: false, reason: 'list not found'}};
+            
+            // Ищем первый скроллящийся родитель (включая сам list)
+            var el = list;
+            while (el && el !== document.documentElement) {{
+                var scrollable = el.scrollHeight > el.clientHeight;
+                var hasOverflow = window.getComputedStyle(el).overflowY === 'auto' || 
+                                  window.getComputedStyle(el).overflowY === 'scroll';
+                if (scrollable && hasOverflow) {{
+                    var oldTop = el.scrollTop;
+                    el.scrollTop += {scroll_amount};
+                    var newTop = el.scrollTop;
+                    return {{
+                        found: true, 
+                        scrolled: newTop > oldTop,
+                        scrollTop: newTop,
+                        scrollHeight: el.scrollHeight,
+                        clientHeight: el.clientHeight,
+                        tagName: el.tagName,
+                        className: el.className
+                    }};
+                }}
+                el = el.parentElement;
+            }}
+            
+            // Если не нашли скроллящийся контейнер — пробуем скроллить окно
+            window.scrollBy(0, {scroll_amount});
+            return {{found: false, reason: 'fallback to window'}};
+        """)
+        
+        if result.get('found'):
+            if result.get('scrolled'):
+                logger.debug(f"📜 Скролл: {result.get('tagName')}.{result.get('className', '')[:30]} | scrollTop: {result.get('scrollTop')}/{result.get('scrollHeight')}")
+                return True
+            else:
+                logger.debug("🛑 Достигнут конец скролл-контейнера")
+                return False
+        else:
+            logger.debug(f"🔄 Fallback: {result.get('reason')}")
+            return True  # Окно проскроллили
+            
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при скролле: {e}")
+        # Fallback: скроллим окно
+        driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
+        return True
+    
 def main():
     url = 'https://yandex.ru/maps/213/moscow/search/электротехника/?ll=37.671027%2C55.743999&sll=37.669529%2C55.754944&sspn=0.749014%2C0.251023&z=11.36'
 
