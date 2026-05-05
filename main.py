@@ -14,21 +14,66 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("telegram_parser.log", encoding='utf-8'),
+        logging.FileHandler("parser_yandex_maps.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-def scrolling_and_parsing(driver):
+def parsing(item, driver):
+    item.click()
+    logger.info("Item clicked")
+    
+    # Ждём загрузки модального окна/страницы
+    WebDriverWait(driver, 5).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "a[class='card-title-view__title-link']"))
+    )
+    time.sleep(1)
+
+    try:
+        title = WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "a[class='card-title-view__title-link']"))
+        ).text.strip()
+        logger.info('Title found')
+    except:
+        title = None
+        logger.warning('⚠️ Title not found')
+
+    try:
+        phone = WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "span[itemprop='telephone']"))
+        ).text.strip()
+        logger.info('Phone found')
+    except:
+        phone = None
+        logger.warning('⚠️ Phone not found')
+
+    try:
+        site = WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "span[class='business-urls-view__text']"))
+        ).text.strip()
+        logger.info('Site found')
+    except:
+        site = None
+        logger.warning('⚠️ Site not found')
+
+    driver.back()
+    logger.info("Back to previous page")
+    
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list"))
+    )
+    time.sleep(1)
+
+    return title, phone, site
+
+
+def scrolling_and_parsing(driver, url):
+    driver.get(url)
     wait = WebDriverWait(driver, 10)
-    container = wait.until(
-            EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list"))
-        )
-    logger.info("✅ Контейнер найден")
     
     batch_size = 5
-    processed_items = set()
+    processed_urls = set()
     total_processed = 0
     empty_scrolls = 0
     MAX_EMPTY_SCROLLS = 3
@@ -37,12 +82,17 @@ def scrolling_and_parsing(driver):
 
     while True:
         try:
+            # Прокрутка
             driver.execute_script("window.scrollBy(0, 1000);")
-            time.sleep(4)  # Ждём подгрузки
+            time.sleep(3)
 
+            # 🔁 Всегда перепоиск контейнера и элементов
             try:
+                container = wait.until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list"))
+                )
                 items = container.find_elements(By.TAG_NAME, "li")
-                visible_items = [i for i in items if i.is_displayed()]
+                visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
             except Exception as e:
                 logger.warning(f"⚠️ Не удалось получить элементы: {e}")
                 visible_items = []
@@ -57,35 +107,53 @@ def scrolling_and_parsing(driver):
 
             empty_scrolls = 0
 
-            new_items = []
-            for item in visible_items:
-                item_hash = hash(item.text[:100])
-                if item_hash not in processed_items:
-                    new_items.append((item, item_hash))
-            
-            if not new_items:
+            # 🔁 Собираем уникальные идентификаторы + индексы для повторного поиска
+            candidates = []
+            for idx, item in enumerate(visible_items):
+                try:
+                    link = item.find_element(By.CSS_SELECTOR, "a[href]")
+                    item_url = link.get_attribute("href")
+                    if item_url and item_url not in processed_urls:
+                        candidates.append((idx, item_url))
+                except:
+                    continue
+
+            if not candidates:
                 continue
 
-            batch = new_items[:batch_size]
-            logger.info(f"📦 Новая порция: {len(batch)} элементов (всего: {total_processed})")
-
-            for idx, (item, item_hash) in enumerate(batch, 1):
+            # 🔁 Обрабатываем по ОДНОМУ элементу за итерацию
+            for idx, item_url in candidates[:batch_size]:
                 try:
-                    processed_items.add(item_hash)
-
-                    title = safe_find("._title_20enb_53") or f"untitled_{total_processed + idx}"
-                    phone = safe_find("._descr_20enb_66") or ""
-                    site = safe_find("._action_views_20enb_121") or ""
-
-                    logger.info(f"→ #{total_processed + idx}: '{title[:40]}...' | {views}")
-
-                    #TODO write parsing func
-
+                    # 🔁 Перепоиск контейнера и элементов перед каждым кликом
+                    container = wait.until(
+                        EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list"))
+                    )
+                    items = container.find_elements(By.TAG_NAME, "li")
+                    visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
+                    
+                    if idx >= len(visible_items):
+                        continue
+                        
+                    fresh_item = visible_items[idx]
+                    
+                    processed_urls.add(item_url)
+                    title, phone, site = parsing(item=fresh_item, driver=driver)
+                    time.sleep(1)
+                    
+                    logger.info(f"→ #{total_processed + 1}: '{title[:40]}' | {phone} | {site}")
                     total_processed += 1
                     logger.info(f"✓ Элемент {total_processed} обработан")
 
                 except Exception as e:
                     logger.error(f"✗ Ошибка в элементе: {e}")
+                    # 🔁 Попытка восстановления после ошибки
+                    try:
+                        if driver.current_url != url:
+                            driver.back()
+                            wait.until(EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list")))
+                            time.sleep(1)
+                    except:
+                        pass
                     continue
 
         except Exception as e:
@@ -95,10 +163,15 @@ def scrolling_and_parsing(driver):
     logger.info(f"🎉 Готово! Обработано: {total_processed}")
     return total_processed
 
-
 def main():
-    url = 'https://yandex.ru/maps/213/moscow/category/electrical_products/184107066/?ll=37.581429%2C55.766542&sll=37.617700%2C55.755863&sspn=1.395264%2C0.525064&z=10'
-    
+    url = 'https://yandex.ru/maps/213/moscow/search/электротехника/?ll=37.671027%2C55.743999&sll=37.669529%2C55.754944&sspn=0.749014%2C0.251023&z=11.36'
+
+    firefox_options = Options()
+    firefox_options.add_argument("--window-size=1920,1080")
+    service = Service(executable_path="E:\Freelance\parser_yandex_maps\geckodriver.exe")
+    driver = webdriver.Firefox(service=service, options=firefox_options)
+
+    scrolling_and_parsing(driver=driver, url=url)
 
 
 if __name__ == '__main__':
