@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DO_NOT_PARSE = ["yandex.ru", "2gis.ru"]
+DO_NOT_PARSE = ["yandex.ru", "2gis.ru", "market.yandex.ru"]
 
 firefox_options = Options()
 firefox_options.add_argument("--window-size=1920,1080")
@@ -45,7 +45,7 @@ def parse_links(url):
     site_name = b_block.text.strip()
     logger.info("Text found")
     
-    if site_name is any(DO_NOT_PARSE):
+    if site_name in DO_NOT_PARSE:
         logger.info(f"Site {site_name} is skipped")
     else:
         with open("parsed_links.txt", "a+", encoding="utf-8") as file:
