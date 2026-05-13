@@ -1,331 +1,576 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import threading
-import queue
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
+                             QTextEdit, QFileDialog, QProgressBar, QMessageBox,
+                             QGroupBox, QFormLayout)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtGui import QFont
+from datetime import datetime
+import time
 import logging
 import os
-import time
-from datetime import datetime
+import sys
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
-from webdriver_manager.firefox import GeckoDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 
-# ==================== НАСТРОЙКИ ====================
-DEFAULT_EXPORT_NAME = "yandex_maps_data.xlsx"
-BATCH_SIZE = 5
-MAX_EMPTY_SCROLLS = 3
+# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
 
-# ==================== ЛОГИКА ПАРСЕРА ====================
-class QueueHandler(logging.Handler):
-    def __init__(self, log_queue):
-        super().__init__()
-        self.log_queue = log_queue
-    def emit(self, record):
-        self.log_queue.put(self.format(record))
+def setup_global_logging():
+    """Глобальная настройка логирования"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("parser_yandex_maps.log", encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+
+setup_global_logging()
+logger = logging.getLogger(__name__)
+
+EXPORT_FILE = "yandex_maps_russia.xlsx"
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+
+def get_driver_path():
+    """Получает путь к драйверу (работает и в .exe)"""
+    if getattr(sys, 'frozen', False):
+        application_path = os.path.dirname(sys.executable)
+    else:
+        application_path = os.path.dirname(os.path.abspath(__file__))
+    
+    # Пробуем Firefox
+    geckodriver_path = os.path.join(application_path, 'geckodriver.exe')
+    if os.path.exists(geckodriver_path):
+        logger.info(f"✅ Найден geckodriver: {geckodriver_path}")
+        return geckodriver_path
+    
+    # Пробуем Chrome
+    chromedriver_path = os.path.join(application_path, 'chromedriver.exe')
+    if os.path.exists(chromedriver_path):
+        logger.info(f"✅ Найден chromedriver: {chromedriver_path}")
+        return chromedriver_path
+    
+    raise FileNotFoundError(
+        "❌ Не найден драйвер!\nПоложите geckodriver.exe или chromedriver.exe в папку с программой."
+    )
+
+def init_excel_file(filepath, columns):
+    """Создаёт Excel-файл с заголовками, если он не существует"""
+    if not os.path.exists(filepath):
+        df = pd.DataFrame(columns=columns)
+        df.to_excel(filepath, index=False, engine='openpyxl')
+        logger.info(f"📄 Создан файл: {filepath}")
+
+def append_to_excel(filepath, data_dict):
+    """Добавляет одну строку в Excel-файл"""
+    try:
+        if os.path.exists(filepath):
+            df_existing = pd.read_excel(filepath, engine='openpyxl')
+            df_new = pd.DataFrame([data_dict])
+            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+        else:
+            df_combined = pd.DataFrame([data_dict])
+        
+        df_combined.to_excel(filepath, index=False, engine='openpyxl')
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения в Excel: {e}")
+        return False
 
 def _scroll_list_container(driver, scroll_amount=600):
+    """Универсальная прокрутка контейнера"""
     try:
         result = driver.execute_script(f"""
         var list = document.querySelector('ul.search-list-view__list');
         if (!list) return {{found: false, reason: 'list not found'}};
+        
         var el = list;
         while (el && el !== document.documentElement) {{
-            if (el.scrollHeight > el.clientHeight && 
-               (getComputedStyle(el).overflowY === 'auto' || getComputedStyle(el).overflowY === 'scroll')) {{
+            var scrollable = el.scrollHeight > el.clientHeight;
+            var hasOverflow = window.getComputedStyle(el).overflowY === 'auto' || 
+                              window.getComputedStyle(el).overflowY === 'scroll';
+            if (scrollable && hasOverflow) {{
                 var oldTop = el.scrollTop;
                 el.scrollTop += {scroll_amount};
-                return {{found: true, scrolled: el.scrollTop > oldTop}};
+                var newTop = el.scrollTop;
+                return {{
+                    found: true, 
+                    scrolled: newTop > oldTop,
+                    scrollTop: newTop,
+                    scrollHeight: el.scrollHeight,
+                    clientHeight: el.clientHeight,
+                    tagName: el.tagName,
+                    className: el.className
+                }};
             }}
             el = el.parentElement;
         }}
+        
         window.scrollBy(0, {scroll_amount});
-        return {{found: false, reason: 'window'}};
+        return {{found: false, reason: 'fallback to window'}};
         """)
-        if result.get('found'): return result.get('scrolled', True)
+        
+        if result.get('found'):
+            return result.get('scrolled', False)
         return True
-    except:
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при скролле: {e}")
         driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
         return True
 
-def init_excel_file(filepath, columns):
-    if not os.path.exists(filepath):
-        pd.DataFrame(columns=columns).to_excel(filepath, index=False, engine='openpyxl')
+# ==================== РАБОЧИЙ ПОТОК ПАРСИНГА ====================
 
-def append_to_excel(filepath, data_dict):
-    try:
-        if os.path.exists(filepath):
-            df_existing = pd.read_excel(filepath, engine='openpyxl')
-            df_new = pd.DataFrame([data_dict]).reindex(columns=df_existing.columns)
-            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-        else:
-            df_combined = pd.DataFrame([data_dict])
-        df_combined.to_excel(filepath, index=False, engine='openpyxl')
-        return True
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения в Excel: {e}")
-        return False
-
-def parsing(item, driver, wait, selected_fields):
-    item.click()
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.card-title-view__title-link")))
-    time.sleep(0.8)
-
-    def safe_find(css, timeout=3):
-        try:
-            return wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, css)), timeout).text.strip()
-        except:
-            return None
-
-    result = {}
-    if selected_fields.get('title'):
-        result['title'] = safe_find("a.card-title-view__title-link")
-    if selected_fields.get('phone'):
-        result['phone'] = safe_find("span[itemprop='telephone']")
-    if selected_fields.get('site'):
-        result['site'] = safe_find("span.business-urls-view__text")
-    if selected_fields.get('address'):
-        result['address'] = safe_find("div.business-contacts-view__address-link")
-
-    driver.back()
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list")))
-    time.sleep(0.5)
-    return result
-
-def run_scraping(url, category, selected_fields, save_dir, log_queue, stop_event):
-    logger = logging.getLogger("scraper")
-    logger.handlers.clear()
-    logger.addHandler(QueueHandler(log_queue))
-    logger.setLevel(logging.INFO)
-
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
+class ParserWorker(QThread):
+    """Фоновый поток для парсинга"""
+    log_signal = pyqtSignal(str, str)
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(int)
+    error_signal = pyqtSignal(str)
     
-    service = Service(executable_path="geckodriver.exe")
-    driver = webdriver.Firefox(service=service, options=options)
-    wait = WebDriverWait(driver, 10)
-
-    try:
-        driver.get(url)
-        
-        # Динамические колонки
-        dynamic_cols = [k for k, v in selected_fields.items() if v]
-        all_cols = ['timestamp', 'category'] + dynamic_cols
-        export_path = os.path.join(save_dir, DEFAULT_EXPORT_NAME)
-        
-        init_excel_file(export_path, all_cols)
-        processed_urls = set()
-        total_processed = 0
-        empty_scrolls = 0
-
-        logger.info(f"🔄 Начинаем прокрутку... Колонки: {', '.join(all_cols)}")
-
-        while not stop_event.is_set():
+    def __init__(self, url, category, filepath):
+        super().__init__()
+        self.url = url
+        self.category = category
+        self.filepath = filepath
+        self.driver = None
+        self.is_stopped = False
+        self.browser_type = None
+    
+    def custom_log(self, message, level="INFO"):
+        """Отправка логов в GUI"""
+        self.log_signal.emit(message, level)
+    
+    def parsing(self, item, driver):
+        """Парсинг одной карточки"""
+        try:
+            item.click()
+            self.custom_log("Item clicked", "INFO")
+            
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a.card-title-view__title-link"))
+            )
+            time.sleep(1)
+            
+            title = phone = site = address = None
+            
             try:
-                list_container = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list")))
-                items = list_container.find_elements(By.TAG_NAME, "li")
-                visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
+                title = WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "a.card-title-view__title-link"))
+                ).text.strip()
             except:
-                visible_items = []
-
-            candidates = []
-            for idx, item in enumerate(visible_items):
-                try:
-                    link = item.find_element(By.CSS_SELECTOR, "a[href*='/maps/org/']")
-                    item_url = link.get_attribute("href")
-                    if item_url and item_url not in processed_urls:
-                        candidates.append((idx, item_url))
-                except:
-                    continue
-
-            if not candidates:
-                empty_scrolls += 1
-                logger.info(f"⏳ Нет новых элементов ({empty_scrolls}/{MAX_EMPTY_SCROLLS})...")
-                if empty_scrolls >= MAX_EMPTY_SCROLLS:
-                    logger.info("✅ Прокрутка завершена.")
-                    break
-                _scroll_list_container(driver)
-                time.sleep(2.5)
-                continue
-
+                self.custom_log('⚠️ Title not found', "WARNING")
+            
+            try:
+                phone = WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "span[itemprop='telephone']"))
+                ).text.strip()
+            except:
+                self.custom_log('⚠️ Phone not found', "WARNING")
+            
+            try:
+                site = WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "span.business-urls-view__text"))
+                ).text.strip()
+            except:
+                self.custom_log('⚠️ Site not found', "WARNING")
+            
+            try:
+                address = WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.business-contacts-view__address-link"))
+                ).text.strip()
+            except:
+                self.custom_log('⚠️ Address not found', "WARNING")
+            
+            driver.back()
+            self.custom_log("Back to previous page", "INFO")
+            
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "search-list-view__list"))
+            )
+            time.sleep(1)
+            
+            return title, phone, site, address
+            
+        except Exception as e:
+            self.custom_log(f"✗ Ошибка парсинга: {e}", "ERROR")
+            return None, None, None, None
+    
+    def run(self):
+        """Основной метод потока"""
+        try:
+            # Получаем путь к драйверу
+            driver_path = get_driver_path()
+            
+            # Определяем тип браузера по имени файла
+            if 'chrome' in driver_path.lower():
+                from selenium.webdriver.chrome.options import Options as ChromeOptions
+                from selenium.webdriver.chrome.service import Service as ChromeService
+                
+                self.custom_log("🚀 Инициализация Chrome...", "INFO")
+                options = ChromeOptions()
+                options.add_argument("--headless")
+                options.add_argument("--disable-gpu")
+                options.add_argument("--no-sandbox")
+                service = ChromeService(driver_path)
+                self.driver = webdriver.Chrome(service=service, options=options)
+                self.browser_type = 'chrome'
+            else:
+                self.custom_log("🚀 Инициализация Firefox...", "INFO")
+                options = Options()
+                options.add_argument("--headless")
+                service = Service(driver_path)
+                self.driver = webdriver.Firefox(service=service, options=options)
+                self.browser_type = 'firefox'
+            
+            self.custom_log("✅ Браузер запущен", "INFO")
+            
+            # Переход на URL
+            self.driver.get(self.url)
+            wait = WebDriverWait(self.driver, 10)
+            
+            # Инициализация Excel
+            excel_columns = ['timestamp', 'category', 'city', 'title', 'phone', 'site']
+            init_excel_file(self.filepath, excel_columns)
+            
+            processed_urls = set()
+            total_processed = 0
             empty_scrolls = 0
-            batch = candidates[:BATCH_SIZE]
-            logger.info(f"📦 Новая порция: {len(batch)} элементов (всего: {total_processed})")
-
-            for _, (item_index, item_url) in enumerate(batch, 1):
-                if stop_event.is_set(): break
+            MAX_EMPTY_SCROLLS = 3
+            BATCH_SIZE = 5
+            
+            self.custom_log(f"🔄 Начинаем прокрутку порциями по {BATCH_SIZE}...", "INFO")
+            
+            while not self.is_stopped:
+                # Поиск элементов
                 try:
-                    list_container = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list")))
+                    list_container = wait.until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list"))
+                    )
                     items = list_container.find_elements(By.TAG_NAME, "li")
                     visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
-                    if item_index >= len(visible_items): continue
-                    
-                    fresh_item = visible_items[item_index]
-                    processed_urls.add(item_url)
-                    data = parsing(fresh_item, driver, wait, selected_fields)
-
-                    logger.info(f"→ {data.get('title', '')[:40]} | {data.get('phone', '')} | {data.get('site', '')}")
-                    
-                    record = {
-                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        'category': category
-                    }
-                    # Добавляем только выбранные поля
-                    for field in dynamic_cols:
-                        record[field] = data.get(field, '')
-                        
-                    if append_to_excel(export_path, record):
-                        logger.info("✅ Сохранено")
-                    else:
-                        logger.warning("⚠️ Не удалось сохранить")
                 except Exception as e:
-                    logger.error(f"✗ Ошибка элемента: {e}")
-                    try:
-                        if driver.current_url != url:
-                            driver.back()
-                            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list")))
-                    except: pass
+                    self.custom_log(f"⚠️ Не удалось получить элементы: {e}", "WARNING")
+                    visible_items = []
+                    time.sleep(1)
                     continue
-
-            total_processed += len(batch)
-            logger.info(f"✓ Батч завершён. Всего: {total_processed}")
-            if not stop_event.is_set():
-                _scroll_list_container(driver)
+                
+                # Сбор кандидатов
+                candidates = []
+                for idx, item in enumerate(visible_items):
+                    try:
+                        link = item.find_element(By.CSS_SELECTOR, "a[href*='/maps/org/']")
+                        item_url = link.get_attribute("href")
+                        if item_url and item_url not in processed_urls:
+                            candidates.append((idx, item_url))
+                    except:
+                        continue
+                
+                # Если нет новых элементов
+                if not candidates:
+                    empty_scrolls += 1
+                    self.custom_log(f"⏳ Нет новых элементов ({empty_scrolls}/{MAX_EMPTY_SCROLLS})...", "INFO")
+                    
+                    if empty_scrolls >= MAX_EMPTY_SCROLLS:
+                        self.custom_log("✅ Прокрутка завершена", "INFO")
+                        break
+                    
+                    _scroll_list_container(self.driver)
+                    time.sleep(2.5)
+                    continue
+                
+                empty_scrolls = 0
+                batch = candidates[:BATCH_SIZE]
+                self.custom_log(f"📦 Новая порция: {len(batch)} элементов (всего: {total_processed})", "INFO")
+                
+                # Обработка батча
+                for batch_idx, (item_index, item_url) in enumerate(batch, 1):
+                    if self.is_stopped:
+                        break
+                    
+                    try:
+                        list_container = wait.until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, "ul.search-list-view__list"))
+                        )
+                        items = list_container.find_elements(By.TAG_NAME, "li")
+                        visible_items = [i for i in items if i.is_displayed() and i.text.strip()]
+                        
+                        if item_index >= len(visible_items):
+                            continue
+                        
+                        fresh_item = visible_items[item_index]
+                        processed_urls.add(item_url)
+                        
+                        title, phone, site, address = self.parsing(fresh_item, self.driver)
+                        
+                        if title is None:
+                            continue
+                        
+                        self.custom_log(f"→ #{total_processed + batch_idx}: '{title[:40]}' | {phone} | {site}", "INFO")
+                        
+                        record = {
+                            'timestamp': datetime.utcnow(),
+                            'category': self.category,
+                            'city': address,
+                            'title': title,
+                            'phone': phone,
+                            'site': site
+                        }
+                        
+                        if append_to_excel(self.filepath, record):
+                            self.custom_log(f"✅ Сохранено", "INFO")
+                        
+                    except Exception as e:
+                        self.custom_log(f"✗ Ошибка в элементе: {e}", "ERROR")
+                        try:
+                            if self.driver.current_url != self.url:
+                                self.driver.back()
+                                wait.until(EC.presence_of_element_located(
+                                    (By.CSS_SELECTOR, "ul.search-list-view__list")
+                                ))
+                                time.sleep(1)
+                        except:
+                            pass
+                        continue
+                
+                if self.is_stopped:
+                    break
+                
+                total_processed += len(batch)
+                self.progress_signal.emit(total_processed)
+                self.custom_log(f"✓ Батч завершён. Всего: {total_processed}", "INFO")
+                
+                _scroll_list_container(self.driver)
                 time.sleep(2.5)
+            
+            self.custom_log(f"🎉 Готово! Обработано: {total_processed}", "INFO")
+            self.finished_signal.emit(total_processed)
+            
+        except FileNotFoundError as e:
+            self.error_signal.emit(str(e))
+        except Exception as e:
+            self.error_signal.emit(f"Критическая ошибка: {e}")
+            self.custom_log(f"❌ {e}", "ERROR")
+        
+        finally:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                    self.custom_log("🔒 Браузер закрыт", "INFO")
+                except:
+                    pass
+    
+    def stop(self):
+        """Остановка парсинга"""
+        self.is_stopped = True
+        self.custom_log("🛑 Остановка по запросу пользователя...", "WARNING")
 
-        logger.info(f"🎉 Готово! Обработано: {total_processed} | Файл: {export_path}")
-    except Exception as e:
-        logger.error(f"🔴 Критическая ошибка: {e}")
-    finally:
-        driver.quit()
-        log_queue.put(None)
 
-# ==================== GUI ====================
-class ParserApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Yandex Maps Parser v2.0")
-        self.root.geometry("750x520")
-        self.stop_event = threading.Event()
-        self.log_queue = queue.Queue()
-        self.worker = None
-        self.save_dir = tk.StringVar(value=os.path.expanduser("~"))
+# ==================== ГЛАВНОЕ ОКНО ====================
 
-        self._build_ui()
-        self._start_log_updater()
-
-    def _build_ui(self):
-        frame_input = ttk.LabelFrame(self.root, text="Настройки")
-        frame_input.pack(fill=tk.X, padx=10, pady=5)
-
-        # URL
-        ttk.Label(frame_input, text="URL поиска:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.entry_url = ttk.Entry(frame_input, width=70)
-        self.entry_url.insert(0, "https://yandex.ru/maps/?text=кафе")
-        self.entry_url.grid(row=0, column=1, padx=5, pady=5)
-
-        # Категория
-        ttk.Label(frame_input, text="Категория:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.entry_category = ttk.Entry(frame_input, width=70)
-        self.entry_category.insert(0, "Кафе")
-        self.entry_category.grid(row=1, column=1, padx=5, pady=5)
-
-        # Папка сохранения
-        ttk.Label(frame_input, text="Папка:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
-        frame_dir = ttk.Frame(frame_input)
-        frame_dir.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
-        self.lbl_dir = ttk.Label(frame_dir, textvariable=self.save_dir, width=50, anchor="w")
-        self.lbl_dir.pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame_dir, text="📁 Выбрать", command=self._select_dir).pack(side=tk.LEFT, padx=5)
-
-        # Чекбоксы полей
-        frame_fields = ttk.LabelFrame(self.root, text="Поля для парсинга")
-        frame_fields.pack(fill=tk.X, padx=10, pady=5)
-        self.fields = {
-            'title': tk.BooleanVar(value=True),
-            'phone': tk.BooleanVar(value=True),
-            'site': tk.BooleanVar(value=True),
-            'address': tk.BooleanVar(value=True)
-        }
-        field_labels = {'title': 'Название', 'phone': 'Телефон', 'site': 'Сайт', 'address': 'Город/Адрес'}
-        for i, (key, label) in enumerate(field_labels.items()):
-            ttk.Checkbutton(frame_fields, text=label, variable=self.fields[key]).grid(row=0, column=i, padx=10, pady=5)
-
-        # Кнопки
-        frame_btn = ttk.Frame(self.root)
-        frame_btn.pack(fill=tk.X, padx=10, pady=5)
-        self.btn_start = ttk.Button(frame_btn, text="▶ Запустить", command=self._start)
-        self.btn_start.pack(side=tk.LEFT, padx=5)
-        self.btn_stop = ttk.Button(frame_btn, text="⏹ Остановить", command=self._stop, state=tk.DISABLED)
-        self.btn_stop.pack(side=tk.LEFT, padx=5)
-
+class ParserWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.parser_thread = None
+        self.init_ui()
+    
+    def init_ui(self):
+        """Инициализация интерфейса"""
+        self.setWindowTitle("Yandex Maps Parser - PyQt6")
+        self.setGeometry(100, 100, 900, 700)
+        
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Группа настроек
+        settings_group = QGroupBox("📋 Настройки парсинга")
+        settings_layout = QFormLayout()
+        settings_layout.setSpacing(8)
+        
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://yandex.ru/maps/...")
+        self.url_input.setMinimumHeight(30)
+        settings_layout.addRow("URL Яндекс Карт:", self.url_input)
+        
+        self.category_input = QLineEdit()
+        self.category_input.setText("Рестораны")
+        self.category_input.setMinimumHeight(30)
+        settings_layout.addRow("Категория:", self.category_input)
+        
+        file_layout = QHBoxLayout()
+        self.file_input = QLineEdit()
+        self.file_input.setText("yandex_maps_russia.xlsx")
+        self.file_input.setMinimumHeight(30)
+        file_layout.addWidget(self.file_input)
+        
+        browse_btn = QPushButton("📁 Обзор...")
+        browse_btn.clicked.connect(self.browse_file)
+        file_layout.addWidget(browse_btn)
+        settings_layout.addRow("Файл Excel:", file_layout)
+        
+        settings_group.setLayout(settings_layout)
+        layout.addWidget(settings_group)
+        
+        # Кнопки управления
+        btn_layout = QHBoxLayout()
+        
+        self.start_btn = QPushButton("▶ Запустить парсинг")
+        self.start_btn.setMinimumHeight(40)
+        self.start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                border-radius: 5px;
+                padding: 5px 15px;
+            }
+            QPushButton:hover { background-color: #45a049; }
+            QPushButton:disabled { background-color: #cccccc; }
+        """)
+        self.start_btn.clicked.connect(self.start_parsing)
+        btn_layout.addWidget(self.start_btn)
+        
+        self.stop_btn = QPushButton("⏹ Остановить")
+        self.stop_btn.setMinimumHeight(40)
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                font-weight: bold;
+                border-radius: 5px;
+                padding: 5px 15px;
+            }
+            QPushButton:hover { background-color: #da190b; }
+            QPushButton:disabled { background-color: #cccccc; }
+        """)
+        self.stop_btn.clicked.connect(self.stop_parsing)
+        self.stop_btn.setEnabled(False)
+        btn_layout.addWidget(self.stop_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        # Прогресс бар
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimumHeight(25)
+        self.progress_bar.setFormat("Обработано: %v")
+        layout.addWidget(self.progress_bar)
+        
         # Лог
-        ttk.Label(self.root, text="Лог выполнения:").pack(anchor=tk.W, padx=10, pady=(5,0))
-        self.txt_log = scrolledtext.ScrolledText(self.root, height=16, state=tk.DISABLED, font=("Consolas", 9))
-        self.txt_log.pack(fill=tk.BOTH, padx=10, pady=5)
-
-    def _select_dir(self):
-        dir_path = filedialog.askdirectory(initialdir=self.save_dir.get())
-        if dir_path:
-            self.save_dir.set(dir_path)
-
-    def _start_log_updater(self):
-        def check_queue():
-            try:
-                while True:
-                    msg = self.log_queue.get_nowait()
-                    if msg is None:
-                        self._on_finished()
-                        return
-                    self.txt_log.config(state=tk.NORMAL)
-                    self.txt_log.insert(tk.END, msg + "\n")
-                    self.txt_log.see(tk.END)
-                    self.txt_log.config(state=tk.DISABLED)
-            except queue.Empty:
-                pass
-            self.root.after(100, check_queue)
-        self.root.after(100, check_queue)
-
-    def _start(self):
-        url = self.entry_url.get().strip()
-        category = self.entry_category.get().strip()
-        if not url or not category:
-            messagebox.showerror("Ошибка", "Заполните URL и Категорию")
+        log_group = QGroupBox("📝 Лог парсинга")
+        log_layout = QVBoxLayout()
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9))
+        self.log_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3e3e3e;
+                border-radius: 3px;
+                padding: 5px;
+            }
+        """)
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group, 1)
+        
+        self.statusBar().showMessage("Готов к работе", 0)
+    
+    def browse_file(self):
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить как", "yandex_maps_russia.xlsx",
+            "Excel Files (*.xlsx);;All Files (*)"
+        )
+        if filepath:
+            self.file_input.setText(filepath)
+    
+    def append_log(self, message, level="INFO"):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        color = {"ERROR": "#ff6b6b", "WARNING": "#ffd93d"}.get(level, "#6bcb77")
+        
+        self.log_text.append(
+            f'<span style="color: #888;">[{timestamp}]</span> '
+            f'<span style="color: {color};">{message}</span>'
+        )
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
+    
+    def start_parsing(self):
+        url = self.url_input.text().strip()
+        category = self.category_input.text().strip()
+        filepath = self.file_input.text().strip()
+        
+        if not url or not category or not filepath:
+            QMessageBox.warning(self, "Ошибка", "Заполните все поля!")
             return
-        if not any(v.get() for v in self.fields.values()):
-            messagebox.showwarning("Внимание", "Выберите хотя бы одно поле для парсинга")
+        
+        if not url.startswith("http"):
+            QMessageBox.warning(self, "Ошибка", "Некорректный URL!")
             return
+        
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.url_input.setEnabled(False)
+        self.category_input.setEnabled(False)
+        self.file_input.setEnabled(False)
+        
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.statusBar().showMessage("Парсинг запущен...", 0)
+        
+        self.parser_thread = ParserWorker(url, category, filepath)
+        self.parser_thread.log_signal.connect(self.append_log)
+        self.parser_thread.progress_signal.connect(self.progress_bar.setValue)
+        self.parser_thread.finished_signal.connect(self.parsing_finished)
+        self.parser_thread.error_signal.connect(self.parsing_error)
+        
+        self.parser_thread.start()
+        self.append_log("🚀 Парсинг запущен", "INFO")
+    
+    def stop_parsing(self):
+        if self.parser_thread and self.parser_thread.isRunning():
+            self.append_log("🛑 Остановка...", "WARNING")
+            self.parser_thread.stop()
+            self.stop_btn.setEnabled(False)
+    
+    def parsing_finished(self, count):
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.url_input.setEnabled(True)
+        self.category_input.setEnabled(True)
+        self.file_input.setEnabled(True)
+        
+        self.statusBar().showMessage(f"Завершено! Обработано: {count}", 5000)
+        QMessageBox.information(self, "Готово", f"Парсинг завершён!\nОбработано записей: {count}")
+    
+    def parsing_error(self, error_msg):
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.url_input.setEnabled(True)
+        self.category_input.setEnabled(True)
+        self.file_input.setEnabled(True)
+        
+        self.statusBar().showMessage("Ошибка!", 5000)
+        QMessageBox.critical(self, "Ошибка", error_msg)
 
-        selected = {k: v.get() for k, v in self.fields.items()}
-        self.stop_event.clear()
-        self.btn_start.config(state=tk.DISABLED)
-        self.btn_stop.config(state=tk.NORMAL)
-        self.worker = threading.Thread(target=run_scraping, args=(
-            url, category, selected, self.save_dir.get(), self.log_queue, self.stop_event
-        ), daemon=True)
-        self.worker.start()
 
-    def _stop(self):
-        self.stop_event.set()
-        self.btn_stop.config(state=tk.DISABLED)
-
-    def _on_finished(self):
-        self.btn_start.config(state=tk.NORMAL)
-        self.btn_stop.config(state=tk.DISABLED)
-        messagebox.showinfo("Готово", "Парсинг завершён.\nФайл сохранён в выбранную папку.")
-
-    def on_closing(self):
-        self.stop_event.set()
-        self.root.destroy()
+# ==================== ЗАПУСК ====================
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ParserApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    
+    window = ParserWindow()
+    window.show()
+    
+    sys.exit(app.exec())
